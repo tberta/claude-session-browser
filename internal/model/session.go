@@ -11,6 +11,7 @@ type SessionInfo struct {
 	ID         string
 	FilePath   string
 	LastActive time.Time
+	Project    string // Encoded project directory name (empty for single-project listings)
 }
 
 // GetSessionID extracts the session ID from a filename

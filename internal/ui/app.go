@@ -37,6 +37,7 @@ type Model struct {
 	clipboardMgr  *clipboard.Manager
 	claudeDir     string
 	version       string
+	listAll       bool
 
 	// UI State
 	width         int
@@ -60,7 +61,7 @@ type Model struct {
 }
 
 // NewApp creates a new app
-func NewApp(claudeDir, version string) *Model {
+func NewApp(claudeDir, version string, listAll bool) *Model {
 	// Initialize search input
 	searchInput := textinput.New()
 	searchInput.Placeholder = "Search sessions..."
@@ -72,6 +73,7 @@ func NewApp(claudeDir, version string) *Model {
 		clipboardMgr: clipboard.NewManager(),
 		claudeDir:    claudeDir,
 		version:      version,
+		listAll:      listAll,
 		loading:      true,
 		width:        80,
 		height:       24,
@@ -421,8 +423,20 @@ func (m *Model) renderSessionList(width, height int) string {
 			}
 		}
 		
-		// Format line to fit within inner width
-		line := fmt.Sprintf("%-24s%s %s", id, matchIndicator, timeStr)
+		// Format line to fit within inner width. In all-projects mode prepend a
+		// shortened project label so sessions from different projects are
+		// distinguishable.
+		var line string
+		if m.listAll && session.Project != "" {
+			proj := shortenProject(session.Project)
+			shortID := session.ID
+			if len(shortID) > 8 {
+				shortID = shortID[:8]
+			}
+			line = fmt.Sprintf("%-22s %-8s%s %s", proj, shortID, matchIndicator, timeStr)
+		} else {
+			line = fmt.Sprintf("%-24s%s %s", id, matchIndicator, timeStr)
+		}
 		if len(line) > innerWidth {
 			line = line[:innerWidth]
 		}
@@ -690,7 +704,13 @@ func (m *Model) ensureVisible() {
 
 func (m *Model) loadSessions() tea.Cmd {
 	return func() tea.Msg {
-		sessions, err := m.parser.ListSessions(m.claudeDir)
+		var sessions []model.SessionInfo
+		var err error
+		if m.listAll {
+			sessions, err = m.parser.ListAllSessions(m.claudeDir)
+		} else {
+			sessions, err = m.parser.ListSessions(m.claudeDir)
+		}
 		return sessionsLoadedMsg{sessions: sessions, err: err}
 	}
 }
@@ -751,6 +771,19 @@ func wrapText(text string, width int) []string {
 	}
 	
 	return lines
+}
+
+// shortenProject turns an encoded project directory name into a compact label
+// for display. The encoding is lossy (both "/" and "." map to "-"), so this is
+// a best-effort: drop the leading dash and keep the trailing portion, which is
+// usually the most identifying part of the path.
+func shortenProject(encoded string) string {
+	proj := strings.TrimPrefix(encoded, "-")
+	const maxLen = 22
+	if len(proj) > maxLen {
+		proj = "…" + proj[len(proj)-(maxLen-1):]
+	}
+	return proj
 }
 
 func getRelativeTime(t time.Time) string {

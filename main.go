@@ -23,7 +23,11 @@ func main() {
 	var help bool
 	flag.BoolVar(&help, "help", false, "Show help")
 	flag.BoolVar(&help, "h", false, "Show help (shorthand)")
-	
+
+	var listAll bool
+	flag.BoolVar(&listAll, "list-all-projects", false, "List sessions from every project under the Claude directory")
+	flag.BoolVar(&listAll, "a", false, "List sessions from every project (shorthand)")
+
 	flag.Parse()
 	
 	// Show help if requested
@@ -46,33 +50,38 @@ func main() {
 	
 	// Set CLAUDE_DIR environment variable for the app
 	os.Setenv("CLAUDE_DIR", claudeDir)
-	
-	// Get current working directory and convert to Claude path format
-	cwd, _ := os.Getwd()
-	claudePath := convertToClaudePath(cwd)
-	
-	// Check if this project exists in the Claude directory
-	projectPath := filepath.Join(claudeDir, claudePath)
-	if _, err := os.Stat(projectPath); err == nil && hasJSONLFiles(projectPath) {
-		// Found matching project for current directory
-		claudeDir = projectPath
-	} else {
-		// No match for current directory, just use first project with JSONL files
-		entries, err := os.ReadDir(claudeDir)
-		if err == nil {
-			for _, entry := range entries {
-				if entry.IsDir() {
-					testPath := filepath.Join(claudeDir, entry.Name())
-					if hasJSONLFiles(testPath) {
-						claudeDir = testPath
-						break
+
+	// In single-project mode, narrow claudeDir down to the project matching the
+	// current working directory. In all-projects mode we keep the root directory
+	// and let the parser walk every project sub-directory.
+	if !listAll {
+		// Get current working directory and convert to Claude path format
+		cwd, _ := os.Getwd()
+		claudePath := convertToClaudePath(cwd)
+
+		// Check if this project exists in the Claude directory
+		projectPath := filepath.Join(claudeDir, claudePath)
+		if _, err := os.Stat(projectPath); err == nil && hasJSONLFiles(projectPath) {
+			// Found matching project for current directory
+			claudeDir = projectPath
+		} else {
+			// No match for current directory, just use first project with JSONL files
+			entries, err := os.ReadDir(claudeDir)
+			if err == nil {
+				for _, entry := range entries {
+					if entry.IsDir() {
+						testPath := filepath.Join(claudeDir, entry.Name())
+						if hasJSONLFiles(testPath) {
+							claudeDir = testPath
+							break
+						}
 					}
 				}
 			}
 		}
 	}
-	
-	app := ui.NewApp(claudeDir, version)
+
+	app := ui.NewApp(claudeDir, version, listAll)
 	
 	// Create the Bubble Tea program
 	p := tea.NewProgram(
@@ -87,9 +96,11 @@ func main() {
 }
 
 func convertToClaudePath(path string) string {
-	// Convert filesystem path to Claude format
-	// e.g., "/Users/davidpaquet/Projects/roo-task-cli" -> "-Users-davidpaquet-Projects-roo-task-cli"
+	// Convert filesystem path to Claude format. Claude Code encodes both path
+	// separators and dots as dashes, e.g.
+	//   "/home/tberta/.oh-my-zsh" -> "-home-tberta--oh-my-zsh"
 	claudePath := strings.ReplaceAll(path, string(filepath.Separator), "-")
+	claudePath = strings.ReplaceAll(claudePath, ".", "-")
 	if !strings.HasPrefix(claudePath, "-") {
 		claudePath = "-" + claudePath
 	}
@@ -119,8 +130,9 @@ Usage:
   claude-session-browser [options]
 
 Options:
-  -d, --claude-dir PATH    Claude projects directory (default: ~/.claude/projects)
-  -h, --help              Show this help message
+  -d, --claude-dir PATH      Claude projects directory (default: ~/.claude/projects)
+  -a, --list-all-projects    List sessions from every project, not just the current one
+  -h, --help                 Show this help message
 
 Environment Variables:
   CLAUDE_DIR              Alternative way to set Claude projects directory
@@ -137,6 +149,9 @@ Examples:
 
   # Specify custom Claude directory
   claude-session-browser --claude-dir ~/my-claude-projects
+
+  # Browse sessions across all projects
+  claude-session-browser --list-all-projects
 
   # Use environment variable
   export CLAUDE_DIR=~/my-claude-projects

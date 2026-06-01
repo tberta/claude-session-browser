@@ -47,6 +47,49 @@ func (p *Parser) ListSessions(claudeDir string) ([]model.SessionInfo, error) {
 	return sessions, nil
 }
 
+// ListAllSessions walks every project sub-directory under rootDir and returns
+// the combined session list. Each session records the encoded project directory
+// it belongs to so the UI can distinguish sessions across projects.
+func (p *Parser) ListAllSessions(rootDir string) ([]model.SessionInfo, error) {
+	projects, err := os.ReadDir(rootDir)
+	if err != nil {
+		return nil, err
+	}
+
+	var sessions []model.SessionInfo
+	for _, project := range projects {
+		if !project.IsDir() {
+			continue
+		}
+
+		projectDir := filepath.Join(rootDir, project.Name())
+		entries, err := os.ReadDir(projectDir)
+		if err != nil {
+			continue
+		}
+
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
+				continue
+			}
+
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+
+			sessions = append(sessions, model.SessionInfo{
+				ID:         model.GetSessionID(entry.Name()),
+				FilePath:   filepath.Join(projectDir, entry.Name()),
+				LastActive: info.ModTime(),
+				Project:    project.Name(),
+			})
+		}
+	}
+
+	return sessions, nil
+}
+
 // ParseFullSession parses a single session with all details
 func (p *Parser) ParseFullSession(filePath string) (*model.FullSession, error) {
 	file, err := os.Open(filePath)
