@@ -37,6 +37,14 @@ var (
 		MarginTop(1).
 		MarginRight(1)
 
+	// Folders pane (left-most); same chrome as the session list
+	foldersListStyle = lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(mutedColor).
+		Padding(1).
+		MarginTop(1).
+		MarginRight(1)
+
 	sessionItemStyle = lipgloss.NewStyle().
 		PaddingLeft(2)
 

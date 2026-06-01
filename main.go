@@ -24,9 +24,9 @@ func main() {
 	flag.BoolVar(&help, "help", false, "Show help")
 	flag.BoolVar(&help, "h", false, "Show help (shorthand)")
 
-	var listAll bool
-	flag.BoolVar(&listAll, "list-all-projects", false, "List sessions from every project under the Claude directory")
-	flag.BoolVar(&listAll, "a", false, "List sessions from every project (shorthand)")
+	var forceAll bool
+	flag.BoolVar(&forceAll, "list-all-projects", false, "Start on the \"All\" folder instead of the current directory's project")
+	flag.BoolVar(&forceAll, "a", false, "Start on \"All\" (shorthand)")
 
 	flag.Parse()
 	
@@ -51,37 +51,14 @@ func main() {
 	// Set CLAUDE_DIR environment variable for the app
 	os.Setenv("CLAUDE_DIR", claudeDir)
 
-	// In single-project mode, narrow claudeDir down to the project matching the
-	// current working directory. In all-projects mode we keep the root directory
-	// and let the parser walk every project sub-directory.
-	if !listAll {
-		// Get current working directory and convert to Claude path format
-		cwd, _ := os.Getwd()
-		claudePath := convertToClaudePath(cwd)
+	// Always scan every project under claudeDir; the folders pane lets the user
+	// switch between them. Pre-select the project matching the current directory
+	// so launching inside a known project shows just its sessions (unless -a
+	// forces the "All" view).
+	cwd, _ := os.Getwd()
+	initialFolder := convertToClaudePath(cwd)
 
-		// Check if this project exists in the Claude directory
-		projectPath := filepath.Join(claudeDir, claudePath)
-		if _, err := os.Stat(projectPath); err == nil && hasJSONLFiles(projectPath) {
-			// Found matching project for current directory
-			claudeDir = projectPath
-		} else {
-			// No match for current directory, just use first project with JSONL files
-			entries, err := os.ReadDir(claudeDir)
-			if err == nil {
-				for _, entry := range entries {
-					if entry.IsDir() {
-						testPath := filepath.Join(claudeDir, entry.Name())
-						if hasJSONLFiles(testPath) {
-							claudeDir = testPath
-							break
-						}
-					}
-				}
-			}
-		}
-	}
-
-	app := ui.NewApp(claudeDir, version, listAll)
+	app := ui.NewApp(claudeDir, version, initialFolder, forceAll)
 	
 	// Create the Bubble Tea program
 	p := tea.NewProgram(
@@ -107,20 +84,6 @@ func convertToClaudePath(path string) string {
 	return claudePath
 }
 
-func hasJSONLFiles(dir string) bool {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return false
-	}
-	
-	for _, entry := range entries {
-		if !entry.IsDir() && filepath.Ext(entry.Name()) == ".jsonl" {
-			return true
-		}
-	}
-	return false
-}
-
 func showHelp() {
 	fmt.Println(`Claude Session Browser
 
@@ -129,29 +92,38 @@ A terminal user interface for browsing and resuming Claude Code sessions.
 Usage:
   claude-session-browser [options]
 
+The browser always scans every project under the Claude directory and shows a
+Folders pane to switch between them. By default it pre-selects the project
+matching the current working directory; use -a to start on "All" instead.
+
 Options:
   -d, --claude-dir PATH      Claude projects directory (default: ~/.claude/projects)
-  -a, --list-all-projects    List sessions from every project, not just the current one
+  -a, --list-all-projects    Start on the "All" folder, ignoring the current directory
   -h, --help                 Show this help message
 
 Environment Variables:
   CLAUDE_DIR              Alternative way to set Claude projects directory
 
 Keyboard Shortcuts:
-  ↑/↓, j/k               Navigate sessions
+  ↑/↓, j/k               Navigate within the focused pane
+  Tab / Shift+Tab        Cycle focus between Folders and Sessions panes
+  h / l                  Focus Folders (left) / Sessions (right)
+  s                      Cycle sort field (Last Active → Name → Project)
+  S                      Toggle sort direction (ascending/descending)
+  /                      Search session content
   Enter                  Copy resume command to clipboard
   r                      Refresh session list
   q                      Quit
 
 Examples:
-  # Run with default directory
+  # Run with default directory (pre-selects the current project's folder)
   claude-session-browser
+
+  # Start on the All folder regardless of current directory
+  claude-session-browser --list-all-projects
 
   # Specify custom Claude directory
   claude-session-browser --claude-dir ~/my-claude-projects
-
-  # Browse sessions across all projects
-  claude-session-browser --list-all-projects
 
   # Use environment variable
   export CLAUDE_DIR=~/my-claude-projects
