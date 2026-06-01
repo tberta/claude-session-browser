@@ -2,6 +2,7 @@ package parser
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -161,6 +162,9 @@ func (p *Parser) ParseFullSession(filePath string) (*model.FullSession, error) {
 				totalCost += cost
 			}
 		}
+
+		// Flatten user/assistant content blocks into transcript entries.
+		flattenLine(line, &session.Messages)
 	}
 
 	// Fallback: Set summary from last 3 user messages if no summary line was found
@@ -189,4 +193,185 @@ func (p *Parser) ParseFullSession(filePath string) (*model.FullSession, error) {
 	session.TotalCostUSD = totalCost
 
 	return session, nil
+}
+
+// --- Transcript flattening -------------------------------------------------
+
+// rawLine is a parse-only view of a JSONL line. message.content is kept raw so
+// we can handle both string and array shapes without failing the whole line.
+type rawLine struct {
+	Type        string      `json:"type"`
+	Message     *rawMessage `json:"message"`
+	Timestamp   string      `json:"timestamp"`
+	IsSidechain bool        `json:"isSidechain"`
+	IsMeta      bool        `json:"isMeta"`
+}
+
+type rawMessage struct {
+	Role    string          `json:"role"`
+	Content json.RawMessage `json:"content"`
+}
+
+type rawBlock struct {
+	Type      string          `json:"type"`
+	Text      string          `json:"text"`
+	Thinking  string          `json:"thinking"`
+	Name      string          `json:"name"`
+	Input     json.RawMessage `json:"input"`
+	ToolUseID string          `json:"tool_use_id"`
+	Content   json.RawMessage `json:"content"`
+	IsError   bool            `json:"is_error"`
+}
+
+// flattenLine decodes one JSONL line and appends its content blocks as Entry
+// values. It is resilient: any decode failure or unknown shape yields no
+// entries rather than an error, so a single bad line never breaks the parse.
+func flattenLine(line string, out *[]model.Entry) {
+	var rl rawLine
+	if err := json.Unmarshal([]byte(line), &rl); err != nil {
+		return
+	}
+	if rl.IsMeta || rl.Message == nil {
+		return
+	}
+
+	ts, _ := time.Parse(time.RFC3339, rl.Timestamp)
+
+	switch rl.Type {
+	case "user":
+		flattenUser(rl, ts, out)
+	case "assistant":
+		flattenAssistant(rl, ts, out)
+	}
+}
+
+func flattenUser(rl rawLine, ts time.Time, out *[]model.Entry) {
+	// content may be a plain string (older format) ...
+	var s string
+	if json.Unmarshal(rl.Message.Content, &s) == nil {
+		if text := strings.TrimSpace(s); text != "" {
+			*out = append(*out, model.Entry{
+				Kind:        model.KindUserText,
+				Text:        text,
+				Timestamp:   ts,
+				IsSidechain: rl.IsSidechain,
+			})
+		}
+		return
+	}
+
+	// ... or an array of content blocks.
+	var blocks []rawBlock
+	if json.Unmarshal(rl.Message.Content, &blocks) != nil {
+		return
+	}
+	for _, b := range blocks {
+		switch b.Type {
+		case "text":
+			if text := strings.TrimSpace(b.Text); text != "" {
+				*out = append(*out, model.Entry{
+					Kind:        model.KindUserText,
+					Text:        text,
+					Timestamp:   ts,
+					IsSidechain: rl.IsSidechain,
+				})
+			}
+		case "tool_result":
+			*out = append(*out, model.Entry{
+				Kind:        model.KindToolResult,
+				Text:        toolResultText(b.Content),
+				Timestamp:   ts,
+				IsSidechain: rl.IsSidechain,
+				IsError:     b.IsError,
+			})
+		}
+	}
+}
+
+func flattenAssistant(rl rawLine, ts time.Time, out *[]model.Entry) {
+	var blocks []rawBlock
+	if json.Unmarshal(rl.Message.Content, &blocks) != nil {
+		return
+	}
+	for _, b := range blocks {
+		switch b.Type {
+		case "text":
+			if text := strings.TrimSpace(b.Text); text != "" {
+				*out = append(*out, model.Entry{
+					Kind:        model.KindAssistantText,
+					Text:        text,
+					Timestamp:   ts,
+					IsSidechain: rl.IsSidechain,
+				})
+			}
+		case "thinking":
+			if text := strings.TrimSpace(b.Thinking); text != "" {
+				*out = append(*out, model.Entry{
+					Kind:        model.KindThinking,
+					Text:        text,
+					Timestamp:   ts,
+					IsSidechain: rl.IsSidechain,
+				})
+			}
+		case "tool_use":
+			*out = append(*out, model.Entry{
+				Kind:        model.KindToolUse,
+				ToolName:    b.Name,
+				Text:        toolInputMarkdown(b.Name, b.Input),
+				Timestamp:   ts,
+				IsSidechain: rl.IsSidechain,
+			})
+		}
+	}
+}
+
+// toolInputMarkdown renders a tool_use input as a markdown code block. Bash
+// commands get a bash-highlighted block (plus an optional description line);
+// everything else is shown as pretty-printed JSON.
+func toolInputMarkdown(name string, input json.RawMessage) string {
+	if len(input) == 0 {
+		return ""
+	}
+	if name == "Bash" {
+		var bash struct {
+			Command     string `json:"command"`
+			Description string `json:"description"`
+		}
+		if json.Unmarshal(input, &bash) == nil && bash.Command != "" {
+			out := "```bash\n" + bash.Command + "\n```"
+			if d := strings.TrimSpace(bash.Description); d != "" {
+				out = "_" + d + "_\n\n" + out
+			}
+			return out
+		}
+	}
+
+	var pretty bytes.Buffer
+	if err := json.Indent(&pretty, input, "", "  "); err == nil {
+		return "```json\n" + pretty.String() + "\n```"
+	}
+	return "```\n" + string(input) + "\n```"
+}
+
+// toolResultText extracts a tool_result's content, which may be a plain string
+// or an array of {type:"text", text:...} blocks.
+func toolResultText(content json.RawMessage) string {
+	if len(content) == 0 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(content, &s) == nil {
+		return strings.TrimSpace(s)
+	}
+	var blocks []rawBlock
+	if json.Unmarshal(content, &blocks) == nil {
+		parts := make([]string, 0, len(blocks))
+		for _, b := range blocks {
+			if b.Type == "text" && strings.TrimSpace(b.Text) != "" {
+				parts = append(parts, b.Text)
+			}
+		}
+		return strings.TrimSpace(strings.Join(parts, "\n"))
+	}
+	return ""
 }

@@ -105,13 +105,17 @@ Environment Variables:
   CLAUDE_DIR              Alternative way to set Claude projects directory
 
 Keyboard Shortcuts:
-  ↑/↓, j/k               Navigate within the focused pane
-  Tab / Shift+Tab        Cycle focus between Folders and Sessions panes
-  h / l                  Focus Folders (left) / Sessions (right)
+  ↑/↓, j/k               Navigate within the focused pane (scroll in Details)
+  Tab / Shift+Tab        Cycle focus: Folders → Sessions → Details
+  h / l                  Move focus left / right between panes
+  Enter                  Open the transcript (focus Details to scroll messages)
+  Esc                    Leave the transcript (focus Sessions)
+  PgUp/PgDn, g/G         Page / jump top / bottom in the transcript
+  t                      Toggle verbose transcript (thinking + full tool detail)
+  c / y                  Copy resume command to clipboard
   s                      Cycle sort field (Last Active → Name → Project)
   S                      Toggle sort direction (ascending/descending)
   /                      Search session content
-  Enter                  Copy resume command to clipboard
   r                      Refresh session list
   q                      Quit
 

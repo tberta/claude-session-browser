@@ -1,6 +1,21 @@
 package ui
 
-import "github.com/charmbracelet/lipgloss"
+import (
+	"github.com/charmbracelet/glamour/ansi"
+	"github.com/charmbracelet/glamour/styles"
+	"github.com/charmbracelet/lipgloss"
+)
+
+// zeroMarginDarkStyle returns glamour's dark style with the document margin
+// removed so rendered markdown fills the narrow Details pane.
+func zeroMarginDarkStyle() ansi.StyleConfig {
+	s := styles.DarkStyleConfig
+	zero := uint(0)
+	s.Document.Margin = &zero
+	s.Document.BlockPrefix = ""
+	s.Document.BlockSuffix = ""
+	return s
+}
 
 var (
 	// Colors
@@ -26,6 +41,12 @@ var (
 		Foreground(mutedColor)
 	
 	highlightStyle = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#FBBF24")).
+		Bold(true)
+
+	// matchLineStyle highlights the current search-match line in the transcript.
+	matchLineStyle = lipgloss.NewStyle().
+		Background(lipgloss.Color("#78350F")).
 		Foreground(lipgloss.Color("#FBBF24")).
 		Bold(true)
 

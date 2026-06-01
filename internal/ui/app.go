@@ -1,9 +1,7 @@
 package ui
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"os/exec"
 	"sort"
@@ -12,7 +10,9 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/davidpaquet/claude-session-browser/internal/clipboard"
 	"github.com/davidpaquet/claude-session-browser/internal/model"
 	"github.com/davidpaquet/claude-session-browser/internal/parser"
@@ -34,6 +34,7 @@ type FocusedPane int
 const (
 	PaneFolders FocusedPane = iota
 	PaneSessions
+	PaneDetails
 )
 
 // SortMode is the field sessions are ordered by.
@@ -97,6 +98,19 @@ type Model struct {
 	// Sort
 	sortMode SortMode
 	sortAsc  bool
+
+	// Transcript browsing (Details pane)
+	detailsScroll    int
+	transcriptLines  []string // cached rendered + wrapped transcript body
+	transcriptPlain  []string // ANSI-stripped lines, parallel to transcriptLines
+	matchLines       []int    // indices of lines containing the search query
+	currentMatch     int      // index into matchLines (-1 == none selected yet)
+	showThinking     bool     // verbosity toggle (thinking + full tool detail)
+	lastDetailsWidth int      // inner width the cache was built at
+	transcriptDirty  bool     // cache needs rebuild
+	detailsViewportRows int   // body viewport rows, set by renderDetails
+	mdRenderer       *glamour.TermRenderer
+	mdRendererWidth  int // word-wrap width the renderer was built at
 
 	// Search State
 	searchEngine     search.Engine
@@ -177,6 +191,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		
 	case fullSessionLoadedMsg:
 		m.fullSession = msg.session
+		// New session: reset transcript scroll and invalidate the render cache.
+		m.detailsScroll = 0
+		m.transcriptDirty = true
 		if msg.err != nil {
 			m.statusMsg = fmt.Sprintf("Error: %v", msg.err)
 			m.statusTimer = time.Now()
@@ -254,112 +271,153 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			
 		case SearchStateResults:
-			// In search results mode - handle navigation
-			switch msg.String() {
-			case "ctrl+c", "q":
-				return m, tea.Quit
-			case "esc":
-				// Clear search and return to normal
-				m.clearSearch()
-				return m, nil
-			case "/":
-				// Return to search input mode
-				m.searchState = SearchStateInput
-				m.searchInput.Focus()
-				return m, textinput.Blink
-			case "up", "k":
-				return m, m.moveSession(-1)
-			case "down", "j":
-				return m, m.moveSession(+1)
-			case "enter":
-				if m.fullSession != nil {
-					cmd := m.fullSession.GetResumeCommand()
-					if err := m.clipboardMgr.Copy(cmd); err != nil {
-						m.statusMsg = fmt.Sprintf("Copy failed: %v", err)
-					} else {
-						m.statusMsg = "Copied to clipboard!"
-					}
-					m.statusTimer = time.Now()
-					return m, tea.Tick(2*time.Second, func(time.Time) tea.Msg {
-						return clearStatusMsg{}
-					})
+			// Search results compose with full transcript browsing. Esc is
+			// context-sensitive: leave the transcript first, then clear search.
+			if msg.String() == "esc" {
+				if m.focusedPane == PaneDetails {
+					m.focusedPane = PaneSessions
+				} else {
+					m.clearSearch()
 				}
-			case "r":
-				m.loading = true
-				m.clearSearch()
-				return m, m.loadSessions()
+				return m, nil
 			}
-			
+			if cmd, handled := m.handleBrowseKey(msg.String()); handled {
+				return m, cmd
+			}
+
 		default:
 			// Normal mode - no search active
-			switch msg.String() {
-			case "ctrl+c", "q":
-				return m, tea.Quit
-
-			case "/":
-				m.enterSearchMode()
-				return m, textinput.Blink
-
-			// Focus movement between panes
-			case "tab", "shift+tab":
-				m.cycleFocus()
-				return m, nil
-			case "h":
-				if m.shouldShowFolders() {
-					m.focusedPane = PaneFolders
-				}
-				return m, nil
-			case "l":
-				m.focusedPane = PaneSessions
-				return m, nil
-
-			// Sorting
-			case "s":
-				m.sortMode = (m.sortMode + 1) % sortModeCount
-				m.applyFilterAndSort()
-				return m, m.loadSelectedCmd()
-			case "S":
-				m.sortAsc = !m.sortAsc
-				m.applyFilterAndSort()
-				return m, m.loadSelectedCmd()
-
-			// Navigation, routed by focused pane
-			case "up", "k":
-				if m.focusedPane == PaneFolders && m.shouldShowFolders() {
-					return m, m.moveFolder(-1)
-				}
-				return m, m.moveSession(-1)
-
-			case "down", "j":
-				if m.focusedPane == PaneFolders && m.shouldShowFolders() {
-					return m, m.moveFolder(+1)
-				}
-				return m, m.moveSession(+1)
-
-			case "enter":
-				if m.fullSession != nil {
-					cmd := m.fullSession.GetResumeCommand()
-					if err := m.clipboardMgr.Copy(cmd); err != nil {
-						m.statusMsg = fmt.Sprintf("Copy failed: %v", err)
-					} else {
-						m.statusMsg = "Copied to clipboard!"
-					}
-					m.statusTimer = time.Now()
-					// Clear the message after 2 seconds
-					return m, tea.Tick(2*time.Second, func(time.Time) tea.Msg {
-						return clearStatusMsg{}
-					})
-				}
-
-			case "r":
-				m.loading = true
-				m.clearSearch()
-				return m, m.loadSessions()
+			if cmd, handled := m.handleBrowseKey(msg.String()); handled {
+				return m, cmd
 			}
 		}
 	}
-	
+
 	return m, nil
+}
+
+// handleBrowseKey handles the shared browsing keys used in both Normal mode and
+// while navigating search results: pane focus, transcript scrolling, sorting,
+// copy, verbosity, search entry, refresh, and quit. It returns (cmd, true) when
+// the key was consumed.
+func (m *Model) handleBrowseKey(key string) (tea.Cmd, bool) {
+	switch key {
+	case "ctrl+c", "q":
+		return tea.Quit, true
+
+	case "/":
+		m.enterSearchMode()
+		return textinput.Blink, true
+
+	// Focus movement between panes
+	case "tab":
+		m.cycleFocus(+1)
+		return nil, true
+	case "shift+tab":
+		m.cycleFocus(-1)
+		return nil, true
+	case "h":
+		m.focusLeft()
+		return nil, true
+	case "l":
+		m.focusRight()
+		return nil, true
+
+	// Enter the transcript (focus Details so j/k scroll it).
+	case "enter":
+		if m.focusedPane == PaneSessions && m.fullSession != nil {
+			m.focusedPane = PaneDetails
+		}
+		return nil, true
+	case "esc":
+		// Only consumed when leaving the transcript; otherwise let the caller
+		// decide (e.g. clear an active search).
+		if m.focusedPane == PaneDetails {
+			m.focusedPane = PaneSessions
+			return nil, true
+		}
+		return nil, false
+
+	// Copy resume command (any focus).
+	case "c", "y":
+		return m.copyResumeCmd(), true
+
+	// Toggle verbose transcript (thinking + full tool detail).
+	case "t":
+		m.showThinking = !m.showThinking
+		m.transcriptDirty = true
+		return nil, true
+
+	// Sorting
+	case "s":
+		m.sortMode = (m.sortMode + 1) % sortModeCount
+		m.applyFilterAndSort()
+		return m.loadSelectedCmd(), true
+	case "S":
+		m.sortAsc = !m.sortAsc
+		m.applyFilterAndSort()
+		return m.loadSelectedCmd(), true
+
+	// Navigation / scrolling, routed by focused pane.
+	case "up", "k":
+		if m.focusedPane == PaneDetails {
+			m.scrollDetails(-1)
+			return nil, true
+		}
+		if m.focusedPane == PaneFolders && m.shouldShowFolders() {
+			return m.moveFolder(-1), true
+		}
+		return m.moveSession(-1), true
+
+	case "down", "j":
+		if m.focusedPane == PaneDetails {
+			m.scrollDetails(+1)
+			return nil, true
+		}
+		if m.focusedPane == PaneFolders && m.shouldShowFolders() {
+			return m.moveFolder(+1), true
+		}
+		return m.moveSession(+1), true
+
+	case "pgup", "ctrl+u", "u":
+		if m.focusedPane == PaneDetails {
+			m.scrollDetails(-m.detailsPage())
+		}
+		return nil, true
+	case "pgdown", "ctrl+d", "d":
+		if m.focusedPane == PaneDetails {
+			m.scrollDetails(+m.detailsPage())
+		}
+		return nil, true
+	// g/G and Home/End jump to the first/last entry of the focused list, or the
+	// top/bottom of the transcript. g/G are provided as terminal-independent
+	// aliases since Home/End escape sequences vary across terminal emulators
+	// (and some, e.g. MobaXterm, may not send a code the app can decode).
+	case "g", "home":
+		return m.jumpToStart(), true
+	case "G", "end":
+		return m.jumpToEnd(), true
+
+	// n / N step through search-query occurrences within the transcript.
+	case "n":
+		if m.searchQuery != "" && len(m.matchLines) > 0 {
+			m.jumpMatch(+1)
+			return nil, true
+		}
+		return nil, false
+	case "N":
+		if m.searchQuery != "" && len(m.matchLines) > 0 {
+			m.jumpMatch(-1)
+			return nil, true
+		}
+		return nil, false
+
+	case "r":
+		m.loading = true
+		m.clearSearch()
+		return m.loadSessions(), true
+	}
+	return nil, false
 }
 
 func (m *Model) View() string {
@@ -386,8 +444,8 @@ func (m *Model) View() string {
 	remaining := m.width
 
 	showFolders := m.shouldShowFolders()
-	if !showFolders {
-		// Folders pane hidden: keep focus on a visible pane.
+	if !showFolders && m.focusedPane == PaneFolders {
+		// Folders pane hidden: move focus off it (leave Details focus intact).
 		m.focusedPane = PaneSessions
 	}
 	if showFolders {
@@ -619,135 +677,129 @@ func (m *Model) renderDetails(width, height int) string {
 	// Account for border, padding, and margins (1 border + 1 padding = 2 each side, +1 top margin)
 	innerHeight := height - 5
 	innerWidth := width - 4
-	
-	if innerHeight < 1 || innerWidth < 1 {
-		return detailsStyle.Width(width).Height(height).Render("")
+
+	style := detailsStyle
+	if m.focusedPane == PaneDetails {
+		style = style.BorderForeground(primaryColor)
 	}
-	
-	lines := []string{}
-	
+
+	if innerHeight < 1 || innerWidth < 1 {
+		return style.Width(width).Height(height).Render("")
+	}
+
 	if m.fullSession == nil {
-		lines = append(lines, "Select a session...")
-		// Pad to fill height
+		lines := []string{"Select a session..."}
 		for len(lines) < innerHeight {
 			lines = append(lines, "")
 		}
-		content := strings.Join(lines, "\n")
-		return detailsStyle.Width(width).Height(height).Render(content)
+		return style.Width(width).Height(height).Render(strings.Join(lines, "\n"))
 	}
-	
-	// Build content
-	lines = append(lines, titleStyle.Render("Session Details"))
-	lines = append(lines, "")
-	
-	// Basic info
-	lines = append(lines, fmt.Sprintf("ID: %s", m.fullSession.ID))
-	lines = append(lines, fmt.Sprintf("Messages: %d", m.fullSession.MessageCount))
-	lines = append(lines, fmt.Sprintf("Cost: $%.4f", m.fullSession.TotalCostUSD))
-	lines = append(lines, "")
-	
-	// Summary
+
+	// Pinned header.
+	header := []string{titleStyle.Render("Session Details"), ""}
+	header = append(header, fmt.Sprintf("ID: %s", m.fullSession.ID))
+	header = append(header, fmt.Sprintf("Messages: %d", m.fullSession.MessageCount))
 	if m.fullSession.Summary != "" {
-		lines = append(lines, "Summary:")
-		wrapped := wrapText(m.fullSession.Summary, innerWidth-2)
-		for _, line := range wrapped {
-			lines = append(lines, "  "+line)
+		sum := wrapText(m.fullSession.Summary, innerWidth-2)
+		if len(sum) > 3 {
+			sum = sum[:3]
 		}
+		header = append(header, "", "Summary:")
+		for _, l := range sum {
+			header = append(header, "  "+l)
+		}
+	}
+	resume := m.fullSession.GetResumeCommand()
+	if len(resume)+2 > innerWidth {
+		resume = resume[:innerWidth-5] + "..."
+	}
+	header = append(header, "", infoStyle.Render(resume))
+	header = append(header, strings.Repeat("─", innerWidth))
+
+	// Ensure the transcript cache matches the current width / verbosity.
+	if m.lastDetailsWidth != innerWidth || m.transcriptDirty {
+		m.buildTranscriptLines(innerWidth)
+	}
+
+	// Body viewport = remaining rows minus 1 for the scroll indicator.
+	bodyViewport := innerHeight - len(header) - 1
+	if bodyViewport < 1 {
+		bodyViewport = 1
+	}
+	m.detailsViewportRows = bodyViewport
+	m.clampDetailsScroll(bodyViewport)
+
+	start := m.detailsScroll
+	if start > len(m.transcriptLines) {
+		start = len(m.transcriptLines)
+	}
+	end := start + bodyViewport
+	if end > len(m.transcriptLines) {
+		end = len(m.transcriptLines)
+	}
+
+	// Index of the line holding the current search match (or -1).
+	currentMatchLine := -1
+	if m.currentMatch >= 0 && m.currentMatch < len(m.matchLines) {
+		currentMatchLine = m.matchLines[m.currentMatch]
+	}
+
+	lines := append([]string{}, header...)
+	for i := start; i < end; i++ {
+		if i == currentMatchLine && i < len(m.transcriptPlain) {
+			// Re-render the current match from plain text so it stands out
+			// (glamour styling is replaced on this one line).
+			lines = append(lines, matchLineStyle.Render(m.transcriptPlain[i]))
+		} else {
+			lines = append(lines, m.transcriptLines[i])
+		}
+	}
+	// Pad body region to its full height so the indicator sits at the bottom.
+	for len(lines) < len(header)+bodyViewport {
 		lines = append(lines, "")
 	}
-	
-	// Show search matches if searching
-	if m.searchQuery != "" {
-		// Find matches for current session
-		var currentMatches []search.Match
-		for _, result := range m.searchResults {
-			if result.SessionID == m.fullSession.ID {
-				currentMatches = result.Matches
-				break
-			}
-		}
-		
-		if len(currentMatches) > 0 {
-			lines = append(lines, fmt.Sprintf("Search Matches (%d):", len(currentMatches)))
-			lines = append(lines, strings.Repeat("─", innerWidth-2))
-			
-			// Show up to 5 matches
-			shown := 0
-			for _, match := range currentMatches {
-				if shown >= 5 {
-					lines = append(lines, fmt.Sprintf("  ... and %d more matches", len(currentMatches)-shown))
-					break
-				}
-				
-				// Use context if available, otherwise fall back to text
-				displayText := match.Context
-				if displayText == "" {
-					displayText = strings.TrimSpace(match.Text)
-				}
-				
-				// Ensure it fits within width
-				if len(displayText) > innerWidth-4 {
-					displayText = displayText[:innerWidth-7] + "..."
-				}
-				
-				lines = append(lines, fmt.Sprintf("  %s", displayText))
-				shown++
-			}
-			lines = append(lines, "")
-		}
-	}
-	
-	// Resume command
-	lines = append(lines, "Resume:")
-	cmd := m.fullSession.GetResumeCommand()
-	if len(cmd)+2 > innerWidth {
-		cmd = cmd[:innerWidth-5] + "..."
-	}
-	lines = append(lines, infoStyle.Render("  "+cmd))
-	lines = append(lines, "")
-	
-	// Check remaining space for JSON
-	usedLines := len(lines)
-	remainingLines := innerHeight - usedLines - 2 // -2 for JSON header
-	
-	if remainingLines > 3 { // Only show JSON if we have decent space
-		lines = append(lines, "Last Raw Message (Complete):")
-		lines = append(lines, "")
-		
-		if len(m.fullSession.LastRawMessages) > 0 {
-			// Pretty print JSON with limited lines
-			var prettyJSON bytes.Buffer
-			rawMsg := m.fullSession.LastRawMessages[0]
-			if err := json.Indent(&prettyJSON, []byte(rawMsg), "", "  "); err == nil {
-				jsonLines := strings.Split(prettyJSON.String(), "\n")
-				shown := 0
-				for _, line := range jsonLines {
-					if shown >= remainingLines-1 {
-						lines = append(lines, mutedTextStyle.Render("  ... (more)"))
-						break
-					}
-					if len(line) > innerWidth-2 {
-						line = line[:innerWidth-5] + "..."
-					}
-					lines = append(lines, mutedTextStyle.Render("  "+line))
-					shown++
-				}
-			}
-		}
-	}
-	
-	// Ensure we don't exceed inner height
+	lines = append(lines, m.scrollIndicator(start, end, len(m.transcriptLines)))
+
 	if len(lines) > innerHeight {
 		lines = lines[:innerHeight]
 	}
-	
-	// Pad to fill height
 	for len(lines) < innerHeight {
 		lines = append(lines, "")
 	}
-	
-	content := strings.Join(lines, "\n")
-	return detailsStyle.Width(width).Height(height).Render(content)
+	return style.Width(width).Height(height).Render(strings.Join(lines, "\n"))
+}
+
+// scrollIndicator returns the bottom status line for the transcript viewport.
+func (m *Model) scrollIndicator(start, end, total int) string {
+	if total == 0 {
+		return mutedTextStyle.Render("[empty]")
+	}
+	arrows := ""
+	if start > 0 {
+		arrows += " ▲"
+	}
+	if end < total {
+		arrows += " ▼"
+	}
+	hint := ""
+	if m.focusedPane != PaneDetails && m.searchState != SearchStateInput {
+		hint = "  [Enter to scroll]"
+	}
+
+	// When searching, surface match navigation state.
+	matchInfo := ""
+	if m.searchQuery != "" {
+		switch {
+		case len(m.matchLines) == 0:
+			matchInfo = "  no matches in transcript"
+		case m.currentMatch < 0:
+			matchInfo = fmt.Sprintf("  %d matches  [n/N to jump]", len(m.matchLines))
+		default:
+			matchInfo = fmt.Sprintf("  match %d/%d  [n/N]", m.currentMatch+1, len(m.matchLines))
+		}
+	}
+
+	return mutedTextStyle.Render(fmt.Sprintf("[%d–%d/%d]%s%s%s", start+1, end, total, arrows, matchInfo, hint))
 }
 
 func (m *Model) renderStatusBar() string {
@@ -759,14 +811,25 @@ func (m *Model) renderStatusBar() string {
 	if strings.Contains(m.statusMsg, "ripgrep") {
 		statusDuration = 10 * time.Second
 	}
+	searching := m.searchState == SearchStateResults
 	if m.statusMsg != "" && time.Since(m.statusTimer) < statusDuration {
 		leftText = m.statusMsg
 	} else if m.searchState == SearchStateInput {
 		leftText = "[Tab/Enter] Navigate results  [Esc] Cancel  Type to search..."
-	} else if m.searchState == SearchStateResults {
-		leftText = "[↑↓] Navigate  [/] Edit search  [Esc] Clear search  [Enter] Copy"
+	} else if m.focusedPane == PaneDetails {
+		back := "[Esc] Back"
+		if searching {
+			back = "[Esc] List"
+		}
+		nav := ""
+		if searching {
+			nav = "[n/N] Match  "
+		}
+		leftText = "[↑↓/jk] Scroll  [g/G] Ends  " + nav + "[t] Detail  " + back + "  [c] Copy"
+	} else if searching {
+		leftText = "[↑↓/jk] Nav  [Enter] View  [n/N] Match  [/] Edit  [Esc] Clear  [c] Copy"
 	} else {
-		leftText = "[↑↓/jk] Nav  [Tab/h/l] Pane  [s] Sort  [S] Dir  [Enter] Copy  [/] Search  [r] Refresh  [q] Quit"
+		leftText = "[↑↓/jk] Nav  [g/G] First/Last  [Tab/h/l] Pane  [Enter] View  [c] Copy  [t] Detail  [s] Sort  [/] Search  [q] Quit"
 	}
 
 	// Create left and right content sections
@@ -949,18 +1012,314 @@ func (m *Model) moveFolder(delta int) tea.Cmd {
 	return m.loadSelectedCmd()
 }
 
-// cycleFocus toggles focus between the Folders and Sessions panes. It is a no-op
-// when the Folders pane is hidden.
-func (m *Model) cycleFocus() {
-	if !m.shouldShowFolders() {
-		m.focusedPane = PaneSessions
+// focusOrder lists the focusable panes left-to-right, omitting Folders when it
+// is hidden.
+func (m *Model) focusOrder() []FocusedPane {
+	if m.shouldShowFolders() {
+		return []FocusedPane{PaneFolders, PaneSessions, PaneDetails}
+	}
+	return []FocusedPane{PaneSessions, PaneDetails}
+}
+
+// focusIndex returns the position of the current pane in focusOrder (defaulting
+// to the Sessions pane when the current pane isn't in the order, e.g. Folders
+// focused while hidden).
+func (m *Model) focusIndex(order []FocusedPane) int {
+	for i, p := range order {
+		if p == m.focusedPane {
+			return i
+		}
+	}
+	for i, p := range order {
+		if p == PaneSessions {
+			return i
+		}
+	}
+	return 0
+}
+
+// cycleFocus moves focus forward (dir>0) or backward (dir<0) through the
+// available panes, wrapping around.
+func (m *Model) cycleFocus(dir int) {
+	order := m.focusOrder()
+	i := m.focusIndex(order)
+	n := len(order)
+	i = ((i+dir)%n + n) % n
+	m.focusedPane = order[i]
+}
+
+// focusLeft / focusRight move focus one pane left / right without wrapping.
+func (m *Model) focusLeft() {
+	order := m.focusOrder()
+	i := m.focusIndex(order)
+	if i > 0 {
+		m.focusedPane = order[i-1]
+	}
+}
+
+func (m *Model) focusRight() {
+	order := m.focusOrder()
+	i := m.focusIndex(order)
+	if i < len(order)-1 {
+		m.focusedPane = order[i+1]
+	}
+}
+
+// copyResumeCmd copies the selected session's resume command to the clipboard
+// and shows a transient status message.
+func (m *Model) copyResumeCmd() tea.Cmd {
+	if m.fullSession == nil {
+		return nil
+	}
+	cmd := m.fullSession.GetResumeCommand()
+	if err := m.clipboardMgr.Copy(cmd); err != nil {
+		m.statusMsg = fmt.Sprintf("Copy failed: %v", err)
+	} else {
+		m.statusMsg = "Copied to clipboard!"
+	}
+	m.statusTimer = time.Now()
+	return tea.Tick(2*time.Second, func(time.Time) tea.Msg {
+		return clearStatusMsg{}
+	})
+}
+
+// detailsViewport returns the transcript body viewport height in rows.
+func (m *Model) detailsViewport() int {
+	if m.detailsViewportRows < 1 {
+		return 1
+	}
+	return m.detailsViewportRows
+}
+
+// detailsPage returns the scroll step for page up/down.
+func (m *Model) detailsPage() int {
+	p := m.detailsViewport() - 1
+	if p < 1 {
+		p = 1
+	}
+	return p
+}
+
+// scrollDetails moves the transcript scroll offset by delta lines and clamps.
+func (m *Model) scrollDetails(delta int) {
+	m.detailsScroll += delta
+	m.clampDetailsScroll(m.detailsViewport())
+}
+
+// jumpToStart / jumpToEnd move to the first / last item of the focused pane, or
+// the top / bottom of the transcript when the Details pane is focused.
+func (m *Model) jumpToStart() tea.Cmd {
+	if m.focusedPane == PaneDetails {
+		m.detailsScroll = 0
+		return nil
+	}
+	if m.focusedPane == PaneFolders && m.shouldShowFolders() {
+		return m.moveFolder(-len(m.folders))
+	}
+	return m.moveSession(-len(m.filteredSessions))
+}
+
+func (m *Model) jumpToEnd() tea.Cmd {
+	if m.focusedPane == PaneDetails {
+		m.detailsScroll = len(m.transcriptLines)
+		m.clampDetailsScroll(m.detailsViewport())
+		return nil
+	}
+	if m.focusedPane == PaneFolders && m.shouldShowFolders() {
+		return m.moveFolder(len(m.folders))
+	}
+	return m.moveSession(len(m.filteredSessions))
+}
+
+// jumpMatch moves to the next (dir>0) or previous (dir<0) transcript line that
+// contains the search query, focusing the Details pane and scrolling the match
+// near the top of the viewport. It is a no-op when there are no matches.
+func (m *Model) jumpMatch(dir int) {
+	if len(m.matchLines) == 0 {
 		return
 	}
-	if m.focusedPane == PaneFolders {
-		m.focusedPane = PaneSessions
+	m.focusedPane = PaneDetails
+
+	if m.currentMatch < 0 {
+		// First jump: pick the match nearest the current scroll position in the
+		// requested direction.
+		if dir > 0 {
+			m.currentMatch = len(m.matchLines) - 1
+			for i, ln := range m.matchLines {
+				if ln >= m.detailsScroll {
+					m.currentMatch = i
+					break
+				}
+			}
+		} else {
+			m.currentMatch = 0
+			for i := len(m.matchLines) - 1; i >= 0; i-- {
+				if m.matchLines[i] <= m.detailsScroll {
+					m.currentMatch = i
+					break
+				}
+			}
+		}
 	} else {
-		m.focusedPane = PaneFolders
+		n := len(m.matchLines)
+		m.currentMatch = ((m.currentMatch+dir)%n + n) % n
 	}
+
+	// Scroll so the match sits just below the top, with one line of context.
+	target := m.matchLines[m.currentMatch] - 1
+	if target < 0 {
+		target = 0
+	}
+	m.detailsScroll = target
+	m.clampDetailsScroll(m.detailsViewport())
+}
+
+// clampDetailsScroll keeps detailsScroll within [0, max] for the given viewport.
+func (m *Model) clampDetailsScroll(viewport int) {
+	max := len(m.transcriptLines) - viewport
+	if max < 0 {
+		max = 0
+	}
+	if m.detailsScroll > max {
+		m.detailsScroll = max
+	}
+	if m.detailsScroll < 0 {
+		m.detailsScroll = 0
+	}
+}
+
+// transcriptRenderer returns a glamour renderer configured for the given
+// word-wrap width, rebuilding it only when the width changes.
+func (m *Model) transcriptRenderer(wrap int) *glamour.TermRenderer {
+	if wrap < 10 {
+		wrap = 10
+	}
+	if m.mdRenderer != nil && m.mdRendererWidth == wrap {
+		return m.mdRenderer
+	}
+	r, err := glamour.NewTermRenderer(
+		glamour.WithStyles(zeroMarginDarkStyle()),
+		glamour.WithWordWrap(wrap),
+		glamour.WithEmoji(),
+	)
+	if err != nil {
+		// Fall back to the standard auto style; if that also fails, leave nil
+		// and the renderer treats bodies as plain text.
+		r, _ = glamour.NewTermRenderer(glamour.WithWordWrap(wrap))
+	}
+	m.mdRenderer = r
+	m.mdRendererWidth = wrap
+	return m.mdRenderer
+}
+
+// renderMarkdown renders md to styled terminal text, trimming the leading/
+// trailing blank lines glamour adds. On any error it returns md unchanged.
+func (m *Model) renderMarkdown(md string, wrap int) []string {
+	r := m.transcriptRenderer(wrap)
+	if r == nil {
+		return strings.Split(md, "\n")
+	}
+	out, err := r.Render(md)
+	if err != nil {
+		return strings.Split(md, "\n")
+	}
+	return strings.Split(strings.Trim(out, "\n"), "\n")
+}
+
+// buildTranscriptLines renders the current session's messages into wrapped,
+// styled lines for the given inner width and verbosity, caching the result.
+func (m *Model) buildTranscriptLines(innerWidth int) {
+	m.lastDetailsWidth = innerWidth
+	m.transcriptDirty = false
+	m.transcriptLines = nil
+	m.transcriptPlain = nil
+	m.matchLines = nil
+	m.currentMatch = -1
+
+	if m.fullSession == nil {
+		return
+	}
+	if len(m.fullSession.Messages) == 0 {
+		m.transcriptLines = []string{mutedTextStyle.Render("(no messages)")}
+		m.transcriptPlain = []string{"(no messages)"}
+		return
+	}
+
+	// Glamour wraps to its own width; leave room for our 2-space indent.
+	wrap := innerWidth - 2
+	if wrap < 10 {
+		wrap = 10
+	}
+
+	var lines []string
+	addBody := func(md string, max int) {
+		body := m.renderMarkdown(md, wrap)
+		if max > 0 && len(body) > max {
+			hidden := len(body) - max
+			body = append(body[:max:max], mutedTextStyle.Render(fmt.Sprintf("  … (%d more lines)", hidden)))
+		}
+		lines = append(lines, body...)
+	}
+
+	for _, e := range m.fullSession.Messages {
+		if e.Kind == model.KindThinking && !m.showThinking {
+			continue
+		}
+
+		header, bodyMax := m.entryHeader(e)
+		lines = append(lines, header)
+
+		switch e.Kind {
+		case model.KindToolUse, model.KindToolResult:
+			if m.showThinking {
+				addBody(e.Text, 0)
+			} else {
+				addBody(e.Text, bodyMax)
+			}
+		default:
+			addBody(e.Text, 0)
+		}
+		lines = append(lines, "")
+	}
+	m.transcriptLines = lines
+
+	// Build an ANSI-stripped mirror for matching, and index the lines that
+	// contain the active search query (case-insensitive).
+	m.transcriptPlain = make([]string, len(lines))
+	query := strings.ToLower(strings.TrimSpace(m.searchQuery))
+	for i, l := range lines {
+		plain := ansi.Strip(l)
+		m.transcriptPlain[i] = plain
+		if query != "" && strings.Contains(strings.ToLower(plain), query) {
+			m.matchLines = append(m.matchLines, i)
+		}
+	}
+}
+
+// entryHeader returns the styled header line for an entry and the max body
+// lines to show in compact mode (0 == unlimited).
+func (m *Model) entryHeader(e model.Entry) (string, int) {
+	sidechain := ""
+	if e.IsSidechain {
+		sidechain = mutedTextStyle.Render(" [sidechain]")
+	}
+	switch e.Kind {
+	case model.KindUserText:
+		return titleStyle.Render("▶ User") + sidechain, 0
+	case model.KindAssistantText:
+		return infoStyle.Render("● Assistant") + sidechain, 0
+	case model.KindThinking:
+		return mutedTextStyle.Render("🧠 thinking") + sidechain, 0
+	case model.KindToolUse:
+		return highlightStyle.Render("🔧 Tool: "+e.ToolName) + sidechain, 6
+	case model.KindToolResult:
+		h := mutedTextStyle.Render("↳ result")
+		if e.IsError {
+			h += errorStyle.Render(" (error)")
+		}
+		return h + sidechain, 4
+	}
+	return "", 0
 }
 
 // shouldShowFolders reports whether the folders pane is rendered given the
@@ -1199,6 +1558,9 @@ func (m *Model) enterSearchMode() {
 		// Still enter search mode but user is warned
 	}
 	
+	// Start search interaction on the Sessions list so the user navigates
+	// results first; they can Enter into the transcript afterwards.
+	m.focusedPane = PaneSessions
 	m.searchState = SearchStateInput
 	m.searchInput.Focus()
 	m.searchInput.SetValue(m.searchQuery) // Keep existing query if any
