@@ -150,6 +150,12 @@ func (p *Parser) ParseFullSession(filePath string) (*model.FullSession, error) {
 				}
 			}
 
+			// Get working directory (last non-empty wins, so a resumed
+			// session reflects the most recent folder it ran in).
+			if cwd, ok := data["cwd"].(string); ok && cwd != "" {
+				session.Cwd = cwd
+			}
+
 			// Get timestamp
 			if ts, ok := data["timestamp"].(string); ok {
 				if t, err := time.Parse(time.RFC3339, ts); err == nil {

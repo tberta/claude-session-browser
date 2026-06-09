@@ -710,10 +710,10 @@ func (m *Model) renderDetails(width, height int) string {
 		}
 	}
 	resume := m.fullSession.GetResumeCommand()
-	if len(resume)+2 > innerWidth {
-		resume = resume[:innerWidth-5] + "..."
+	header = append(header, "")
+	for _, l := range wrapText(resume, innerWidth) {
+		header = append(header, infoStyle.Render(l))
 	}
-	header = append(header, "", infoStyle.Render(resume))
 	header = append(header, strings.Repeat("─", innerWidth))
 
 	// Ensure the transcript cache matches the current width / verbosity.

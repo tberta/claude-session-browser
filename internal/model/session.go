@@ -1,6 +1,7 @@
 package model
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -50,11 +51,44 @@ type FullSession struct {
 	LastActive      time.Time
 	MessageCount    int
 	TotalCostUSD    float64
+	Cwd             string // working directory the session ran in (from the JSONL "cwd" field)
 	LastRawMessages []string
 	Messages        []Entry // ordered, flattened transcript for browsing
 }
 
-// GetResumeCommand returns the command to resume this session
+// GetResumeCommand returns the command to resume this session. When the session
+// recorded a working directory, it is prefixed with a `cd` so the resumed
+// session starts in the folder where the session originally took place.
 func (s *FullSession) GetResumeCommand() string {
-	return "claude --resume " + s.ID
+	resume := "claude --resume " + s.ID
+	if s.Cwd == "" {
+		return resume
+	}
+	return "cd " + formatCdPath(s.Cwd) + " && " + resume
+}
+
+// formatCdPath renders dir for use as a `cd` argument, collapsing the user's
+// home directory to ~ for readability and quoting only when necessary. A
+// leading ~/ is kept unquoted so the shell still performs tilde expansion.
+func formatCdPath(dir string) string {
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if dir == home {
+			return "~"
+		}
+		if rest := strings.TrimPrefix(dir, home+"/"); rest != dir {
+			return "~/" + shellQuote(rest)
+		}
+	}
+	return shellQuote(dir)
+}
+
+// shellQuote returns s wrapped in single quotes when it contains characters that
+// the shell would otherwise interpret, so paths with spaces or other special
+// characters remain a single argument to `cd`.
+func shellQuote(s string) string {
+	if s != "" && !strings.ContainsAny(s, " \t\n'\"\\$`*?;&|<>()[]{}#~") {
+		return s
+	}
+	// Wrap in single quotes, escaping any embedded single quotes.
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
